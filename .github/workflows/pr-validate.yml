@@ -1,0 +1,139 @@
+name: PR Validate
+
+# ---------------------------------------------------------------------------
+# Pipeline 2 of 2 — PULL REQUEST GATE
+#
+# Triggers:
+#   pull_request opened / synchronize / reopened
+#   (never on the merge itself)
+#
+# What it does:
+#   Always  -> databricks bundle validate --target dev
+#   If the PR targets `main` -> also validate uat and prod
+#
+# It NEVER deploys and NEVER runs a pipeline. Validation only.
+#
+# This is the first gate a change passes before workflow 1 (deploy.yml) can
+# ever deploy it.
+# ---------------------------------------------------------------------------
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate bundle
+    runs-on: ubuntu-latest
+
+    # Credentials at JOB level. A step-scoped env block applies only to that
+    # step, which leaves every later step unauthenticated:
+    #   Error: default auth: cannot configure default credentials
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      # Secret is DATABRICKS_PAT, but the CLI only reads DATABRICKS_TOKEN.
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_PAT }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # NOTE: this action has NO floating `v1` tag — only version-pinned tags such as
+      # v1.21.0. Referencing `databricks/setup-cli@v1` fails to resolve.
+      - name: Set up Databricks CLI
+        uses: databricks/setup-cli@v1.21.0
+        with:
+          version: 1.21.0
+
+      # ---------------------------------------------------------------
+      # Auth is required even though this workflow only validates.
+      #
+      # Teaching point: `bundle validate` is NOT a purely offline command.
+      # It resolves workspace.current_user and computes artifact/state paths
+      # by calling the workspace API, which is why the resolved output shows
+      # a concrete User and Path. That also means validate can fail because
+      # of workspace reachability, not because of your YAML.
+      # ---------------------------------------------------------------
+      - name: Authenticate to Databricks
+        run: |
+          set -euo pipefail
+          if [ -z "${DATABRICKS_TOKEN}" ]; then
+            echo "::error::DATABRICKS_PAT secret is empty or missing"
+            exit 1
+          fi
+          databricks --version
+          # --target is REQUIRED: the CLI detects databricks.yml in the working
+          # directory and fails with "Error: please specify target" otherwise.
+          databricks current-user me --output json --target dev
+
+      # ---------------------------------------------------------------
+      # 1. ALWAYS validate the dev target.
+      #    This is the fastest signal that the YAML is well-formed and that
+      #    every ${...} expression resolves.
+      # ---------------------------------------------------------------
+      - name: Validate dev
+        run: databricks bundle validate --target dev
+
+      # ---------------------------------------------------------------
+      # 2. When the PR targets `main`, it is heading for production, so
+      #    validate uat and prod as well.
+      #
+      #    Their root_path and mode differ, which means template resolution
+      #    differs. A change that passes dev can still fail prod — for
+      #    example if it relies on a dev-only catalog.
+      # ---------------------------------------------------------------
+      - name: Validate uat and prod
+        if: github.base_ref == 'main'
+        run: |
+          databricks bundle validate --target uat
+          databricks bundle validate --target prod
+
+      # ---------------------------------------------------------------
+      # 3. Cheap static check: did anyone leave Python bytecode or local
+      #    state in the commit? Those get synced to the workspace by
+      #    `bundle deploy`.
+      # ---------------------------------------------------------------
+      - name: Check for committed build artefacts
+        run: |
+          if git ls-files | grep -E '(__pycache__|\.pyc$|\.databricks/bundle/)'; then
+            echo "::error::Compiled Python or local bundle state is committed. Add these to .gitignore."
+            exit 1
+          fi
+          echo "No stray artefacts found."
+
+# ===========================================================================
+# §Why `pull_request` and not `pull_request_target`
+#
+# `pull_request` runs the workflow from the MERGED-BRANCH code with a
+# read-only token and no access to repository secrets. That is the safe
+# choice: a fork cannot steal your Databricks token by opening a PR.
+#
+# `pull_request_target` DOES get secrets but runs the BASE branch's code with
+# write scope — so it must never check out or execute untrusted PR code.
+#
+# Do not "fix" a failing check by switching to pull_request_target.
+#
+# ===========================================================================
+# §Secrets
+#
+#   DATABRICKS_HOST    e.g. https://dbc-xxxx.cloud.databricks.com
+#                      OPTIONAL — if unset, read from `workspace.host`
+#                      in databricks.yml.
+#   DATABRICKS_PAT     a Databricks Personal Access Token
+#
+# For PRs from forks, secrets are NOT exposed to `pull_request` runs. If you
+# need fork PRs validated, use a service principal with the narrowest
+# possible privileges (read-only on the workspace) and consider
+# `pull_request_target` with extreme care.
+# ===========================================================================

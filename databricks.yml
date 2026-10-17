@@ -36,6 +36,9 @@ targets:
     variables:
       catalog: prepzee-uat
       schema: sales
+    permissions:
+      - user_name: chgoutam@gmail.com
+        level: CAN_MANAGE
   prod:
     mode: production
     workspace:
