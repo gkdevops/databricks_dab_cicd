@@ -1,0 +1,196 @@
+name: Deploy Bundle
+
+# ---------------------------------------------------------------------------
+# Pipeline 1 of 2 — DEPLOYMENT
+#
+# Triggers:
+#   1. workflow_dispatch  -> manual, with a choice of environment
+#   2. push to develop   -> automatic, always to dev (the personal sandbox)
+#
+# Paired with: .github/workflows/pr-validate.yml
+# (PR validation runs first; this workflow only runs after code lands on develop)
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to deploy"
+        type: choice
+        required: true
+        default: dev
+        options:
+          - dev
+          - uat
+          - prod
+      run_pipeline:
+        description: "Trigger the pipeline after deploying"
+        type: boolean
+        required: true
+        default: true
+
+  push:
+    branches:
+      - develop
+
+# Cancel a superseded run on the same ref. Prevents two deploys racing to the
+# same target when several commits land quickly.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    # Push events carry no inputs, so fall back to dev.
+    # ${{ inputs.environment }} is the modern spelling of
+    # ${{ github.event.inputs.environment }}.
+    #
+    # Credentials live at JOB level, not step level. An env block on a single
+    # step applies only to that step, so a step-scoped token silently leaves
+    # every later step unauthenticated:
+    #   Error: default auth: cannot configure default credentials
+    env:
+      ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+      # Do NOT write this as `inputs.run_pipeline || 'true'`.
+      # `||` is falsy-coalescing, not a null check: an unticked checkbox gives
+      # boolean false, so `false || 'true'` evaluates to 'true' and the run
+      # steps execute anyway. Test for the event explicitly instead:
+      #   push                      -> true  (always deploy and run to dev)
+      #   workflow_dispatch, ticked -> true
+      #   workflow_dispatch, unticked-> false
+      RUN_PIPELINE: ${{ github.event_name == 'push' || inputs.run_pipeline }}
+      # DATABRICKS_HOST is optional. If this secret is unset the value is empty
+      # and the CLI falls back to `workspace.host` in databricks.yml.
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      # The repository secret is called DATABRICKS_PAT, but the CLI only
+      # recognises the environment variable DATABRICKS_TOKEN.
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_PAT }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Installs the Databricks CLI.
+      #
+      # NOTE: this action has NO floating `v1` tag — only version-pinned tags
+      # like v1.21.0. Using `databricks/setup-cli@v1` fails with:
+      #     Unable to resolve action `databricks/setup-cli@v1`,
+      #     unable to find version `v1`
+      # The version is pinned so CI is reproducible and matches what
+      # deployment.md documents.
+      - name: Set up Databricks CLI
+        uses: databricks/setup-cli@v1.21.0
+        with:
+          version: 1.21.0
+
+      # Auth via a personal access token.
+      #
+      # IMPORTANT teaching note: the '~' in workspace.root_path expands to
+      # /Workspace/Users/<whoever authenticates>. So a CI deploy of the dev
+      # target lands in the PAT owner's home folder, NOT in the folder of the
+      # engineer who pushed the commit. For real production pipelines, use a
+      # service principal with IS_OWNER on the pipeline instead — see §Secrets.
+      - name: Authenticate
+        run: |
+          set -euo pipefail
+          if [ -z "${DATABRICKS_TOKEN}" ]; then
+            echo "::error::DATABRICKS_PAT secret is empty or missing"
+            exit 1
+          fi
+          databricks --version
+          # --target is REQUIRED here. The CLI detects the databricks.yml in the
+          # working directory and refuses to run bundle-aware commands without
+          # one, failing with:
+          #   Error: please specify target
+          databricks current-user me --output json --target "${ENVIRONMENT}"
+
+      # ---------------------------------------------------------------
+      # 1. VALIDATE — makes NO changes to the workspace. Always first.
+      # ---------------------------------------------------------------
+      - name: Validate
+        run: databricks bundle validate --target "${{ env.ENVIRONMENT }}"
+
+      # Show what every ${...} template expression resolved to.
+      # Best debugging tool in DABs and it costs nothing.
+      - name: Show resolved configuration
+        run: databricks bundle validate --target "${{ env.ENVIRONMENT }}" --output json
+
+      # ---------------------------------------------------------------
+      # 2. PLAN — the diff, without applying it. Free.
+      #    In CI, treat an unexpected diff as a signal, not a failure.
+      # ---------------------------------------------------------------
+      - name: Plan
+        run: databricks bundle plan --target "${{ env.ENVIRONMENT }}"
+
+      # ---------------------------------------------------------------
+      # 3. DEPLOY — reconciles the workspace with the YAML.
+      # ---------------------------------------------------------------
+      - name: Deploy
+        run: databricks bundle deploy --target "${{ env.ENVIRONMENT }}"
+
+      # ---------------------------------------------------------------
+      # 4. SUMMARY — proves what now exists, and shows the real IDs.
+      # ---------------------------------------------------------------
+      - name: Summary
+        run: databricks bundle summary --target "${{ env.ENVIRONMENT }}"
+
+      # ---------------------------------------------------------------
+      # 5. RUN — deploy and run are separate steps.
+      #    Skipped automatically for non-dev targets so that a manual
+      #    production deploy refreshes code without immediately reprocessing
+      #    production data. Flip this if you want them always coupled.
+      # ---------------------------------------------------------------
+      - name: Run pipeline
+        if: env.RUN_PIPELINE == 'true' && env.ENVIRONMENT == 'dev'
+        run: databricks bundle run sdp_pipeline --target "${{ env.ENVIRONMENT }}"
+
+      # ---------------------------------------------------------------
+      # 6. JOB PATH — verify the job -> pipeline_task wiring.
+      # ---------------------------------------------------------------
+      - name: Run job
+        if: env.RUN_PIPELINE == 'true' && env.ENVIRONMENT != 'dev'
+        run: databricks bundle run sdp_pipeline_job --target "${{ env.ENVIRONMENT }}"
+
+# ===========================================================================
+# §Secrets
+#
+# Repository -> Settings -> Secrets and variables -> Actions:
+#
+#   DATABRICKS_HOST    e.g. https://dbc-xxxx.cloud.databricks.com
+#                      OPTIONAL — if unset, the host is read from the
+#                      `workspace.host` key in databricks.yml.
+#   DATABRICKS_PAT     a Databricks Personal Access Token
+#
+# Prefer a SERVICE PRINCIPAL over a PAT for anything long-lived. Replace the
+# Authenticate step above with:
+#
+#   - name: Authenticate
+#     uses: databricks/authentication@v1
+#     with:
+#       host: ${{ secrets.DATABRICKS_HOST }}
+#       client-id: ${{ secrets.DATABRICKS_CLIENT_ID }}
+#       client-secret: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+#
+# The service principal must hold IS_OWNER on the deployed pipelines and
+# CREATE SCHEMA on the target catalog, otherwise bundle deploy fails.
+#
+# ===========================================================================
+# §Branch strategy
+#
+#   feature/*  ->  PR validation only (workflow 2)
+#   develop    ->  automatic dev deploy (this workflow)
+#   main       ->  manual uat/prod deploy via workflow_dispatch
+#
+# Nothing reaches uat or prod automatically. That is deliberate: production
+# promotion should be a human decision.
